@@ -1,5 +1,5 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
+Autoresearch pretraining script. Single-file training that automatically uses all visible NVIDIA GPUs.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
 """
@@ -433,11 +433,15 @@ def get_weight_decay(progress, recipe):
     return recipe.weight_decay * (1 - progress)
 
 
-def load_checkpoint_if_present(model, optimizer, path):
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def load_checkpoint_if_present(model, optimizer, path, device):
     if not path:
         return {"step": 0, "total_training_time": 0.0}
-    checkpoint = torch.load(path, map_location="cuda")
-    model.load_state_dict(checkpoint["model"])
+    checkpoint = torch.load(path, map_location=device)
+    unwrap_model(model).load_state_dict(checkpoint["model"])
     if optimizer is not None and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
     return checkpoint.get("trainer", {"step": 0, "total_training_time": 0.0})
@@ -449,7 +453,7 @@ def save_checkpoint(path, model, optimizer, trainer_state, recipe, config):
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "trainer": trainer_state,
         "recipe": recipe.to_json_dict(),
@@ -462,7 +466,10 @@ def run_training(args):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
-    device = torch.device("cuda")
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 1:
+        raise RuntimeError("Training requires at least one NVIDIA GPU")
+    device = torch.device("cuda:0")
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     H100_BF16_PEAK_FLOPS = 989.5e12
     recipe = TrainRecipe.from_json(args.recipe)
@@ -478,16 +485,19 @@ def run_training(args):
         model = GPT(config)
     model.to_empty(device=device)
     model.init_weights()
-    param_counts = model.num_scaling_params()
+    if num_gpus > 1:
+        model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
+    base_model = unwrap_model(model)
+    param_counts = base_model.num_scaling_params()
     num_params = param_counts["total"]
-    num_flops_per_token = model.estimate_flops()
+    num_flops_per_token = base_model.estimate_flops()
     print("Parameter counts:")
     for key, value in param_counts.items():
         print(f"  {key:24s}: {value:,}")
-    tokens_per_fwdbwd = recipe.device_batch_size * MAX_SEQ_LEN
+    tokens_per_fwdbwd = recipe.device_batch_size * MAX_SEQ_LEN * num_gpus
     assert recipe.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = recipe.total_batch_size // tokens_per_fwdbwd
-    optimizer = model.setup_optimizer(
+    optimizer = base_model.setup_optimizer(
         unembedding_lr=recipe.unembedding_lr,
         embedding_lr=recipe.embedding_lr,
         scalar_lr=recipe.scalar_lr,
@@ -495,12 +505,14 @@ def run_training(args):
         matrix_lr=recipe.matrix_lr,
         weight_decay=recipe.weight_decay,
     )
-    trainer_state = load_checkpoint_if_present(model, optimizer, args.load_checkpoint)
-    compiled_model = torch.compile(model, dynamic=False)
-    train_loader = make_dataloader(tokenizer, recipe.device_batch_size, MAX_SEQ_LEN, "train")
+    trainer_state = load_checkpoint_if_present(model, optimizer, args.load_checkpoint, device)
+    compiled_model = model if num_gpus > 1 else torch.compile(model, dynamic=False)
+    global_batch_size = recipe.device_batch_size * num_gpus
+    train_loader = make_dataloader(tokenizer, global_batch_size, MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)
     time_budget = args.time_budget or TIME_BUDGET
     print(f"Time budget: {time_budget}s")
+    print(f"Using {num_gpus} GPU(s) with per-GPU batch size {recipe.device_batch_size} (global batch size {global_batch_size})")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
     t_start_training = time.time()
     smooth_train_loss = 0.0
@@ -552,12 +564,12 @@ def run_training(args):
     total_tokens = step * recipe.total_batch_size
     compiled_model.eval()
     with autocast_ctx:
-        selection_bpb = evaluate_bpb(compiled_model, tokenizer, recipe.device_batch_size, split=args.selection_split)
-        report_bpb = evaluate_bpb(compiled_model, tokenizer, recipe.device_batch_size, split=args.report_split)
+        selection_bpb = evaluate_bpb(compiled_model, tokenizer, global_batch_size, split=args.selection_split)
+        report_bpb = evaluate_bpb(compiled_model, tokenizer, global_batch_size, split=args.report_split)
     t_end = time.time()
     startup_time = t_start_training - t_start
     steady_state_mfu = 100 * num_flops_per_token * recipe.total_batch_size * max(step - 10, 0) / max(total_training_time, 1e-6) / H100_BF16_PEAK_FLOPS
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    peak_vram_mb = max(torch.cuda.max_memory_allocated(i) for i in range(num_gpus)) / 1024 / 1024
     trainer_state = {"step": step, "total_training_time": total_training_time, "epoch": epoch}
     save_checkpoint(args.save_checkpoint, model, optimizer if args.save_optimizer else None, trainer_state, recipe, config)
     metrics = {
