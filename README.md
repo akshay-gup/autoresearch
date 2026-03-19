@@ -10,11 +10,13 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 The repo is deliberately kept small and only really has three files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). It now exposes separate `selection` and `report` holdouts for lineage search.
+- **`train.py`** — the execution engine for one training run. It still owns the GPT model, optimizer (Muon + AdamW), and training loop, but now also supports recipe import/export, checkpoint inheritance, resumability, and machine-readable metrics output.
+- **`evolve.py`** — lineage-level search loop. It initializes parent lineages, spawns descendant runs, logs mutations, trains/evaluates children, and scores parents using descendant/clade performance.
+- **`lineage*.py` / `mutate.py`** — small support modules for lineage metadata, archive storage, mutation operators, and lineage scoring.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+By design, individual descendant runs still use a fixed wall-clock budget, but the evolutionary loop now scores **lineages** rather than single runs. Inner-loop selection uses **selection_bpb** on a dedicated selection holdout shard, while final reporting uses **report_bpb** on a separate untouched report shard.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
@@ -52,11 +54,70 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py         — constants, data prep + split-aware runtime utilities
+train.py           — single experiment runner with checkpoint/recipe support
+evolve.py          — lineage search CLI
+lineage.py         — lineage/descendant metadata schema
+lineage_store.py   — persistent archive layout + JSONL logs
+lineage_score.py   — descendant/clade scoring
+mutate.py          — recipe mutation and optional recombination helpers
+program.md         — agent instructions
+pyproject.toml     — dependencies
 ```
+
+
+## Lineage search
+
+The repository can now run a minimal lineage-level evolutionary loop without rewriting the existing training stack. The inheritance unit is a **lineage package**: git-tracked code snapshot + recipe JSON + checkpoint artifact + mutation metadata. The selection unit is a **parent lineage scored from its descendants** under a fixed compute budget.
+
+### Archive layout
+
+A lineage run creates a persistent archive like:
+
+```
+archive/
+  lineages/
+  artifacts/
+    checkpoints/
+    optimizer/
+    recipes/
+    results/
+    mutations/
+    logs/
+```
+
+Each lineage JSON stores lineage ids, parent ids, git commit, checkpoint/optimizer paths, recipe hash, mutation log path, generation, cumulative compute, descendant history, lineage selection metrics, and timestamps.
+
+### Usage example
+
+Initialize a parent lineage from the current baseline recipe/checkpoint state:
+
+```bash
+uv run python evolve.py init \
+  --archive-root archive \
+  --lineage-id baseline
+```
+
+Run one generation of lineage search with four descendants from that parent:
+
+```bash
+uv run python evolve.py generation \
+  --archive-root archive \
+  --parents baseline \
+  --children-per-parent 4 \
+  --time-budget 60 \
+  --promote-top-k 1
+```
+
+This will:
+
+1. Load the parent lineage recipe and inherited checkpoint if present.
+2. Spawn `N` mutated descendants.
+3. Train/evaluate each descendant for the fixed budget slice.
+4. Record mutation logs and result JSON files.
+5. Score the parent lineage using best descendant selection loss, average improvement, recent slope, optional novelty bonus, and compute penalty.
+
+Rare recombination is also available with `--enable-recombination --recombination-rate 0.1`, which keeps checkpoint inheritance from one parent and recipe fields from another parent, with every recombination logged.
 
 ## Design choices
 

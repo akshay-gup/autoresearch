@@ -40,8 +40,12 @@ DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+SELECTION_SHARD = MAX_SHARD - 1  # lineage search holdout shard
+REPORT_SHARD = MAX_SHARD      # final untouched report shard
+SELECTION_FILENAME = f"shard_{SELECTION_SHARD:05d}.parquet"
+REPORT_FILENAME = f"shard_{REPORT_SHARD:05d}.parquet"
+VAL_SHARD = SELECTION_SHARD   # backward-compatible alias
+VAL_FILENAME = SELECTION_FILENAME
 VOCAB_SIZE = 8192
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
@@ -89,12 +93,13 @@ def download_single_shard(index):
 
 
 def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+    """Download training shards + pinned selection/report shards."""
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
     ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    for holdout_shard in (SELECTION_SHARD, REPORT_SHARD):
+        if holdout_shard not in ids:
+            ids.append(holdout_shard)
 
     # Count what's already downloaded
     existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
@@ -124,7 +129,8 @@ def list_parquet_files():
 
 def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
     """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+    holdout_suffixes = (SELECTION_FILENAME, REPORT_FILENAME)
+    parquet_paths = [p for p in list_parquet_files() if not p.endswith(holdout_suffixes)]
     nchars = 0
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
@@ -255,12 +261,17 @@ def _document_batches(split, tokenizer_batch_size=128):
     """Infinite iterator over document batches from parquet files."""
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    selection_path = os.path.join(DATA_DIR, SELECTION_FILENAME)
+    report_path = os.path.join(DATA_DIR, REPORT_FILENAME)
     if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
+        parquet_paths = [p for p in parquet_paths if p not in {selection_path, report_path}]
         assert len(parquet_paths) > 0, "No training shards found."
+    elif split in {"val", "selection"}:
+        parquet_paths = [selection_path]
+    elif split == "report":
+        parquet_paths = [report_path]
     else:
-        parquet_paths = [val_path]
+        raise ValueError(f"Unknown split: {split}")
     epoch = 1
     while True:
         for filepath in parquet_paths:
@@ -280,7 +291,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     When no document fits remaining space, crops shortest doc to fill exactly.
     100% utilization (no padding).
     """
-    assert split in ["train", "val"]
+    assert split in ["train", "val", "selection", "report"]
     row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
@@ -341,7 +352,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, split="selection"):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -350,7 +361,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
     token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, split)
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
