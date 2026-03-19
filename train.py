@@ -78,7 +78,10 @@ class TrainRecipe:
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+    y = F.rms_norm(x, (x.size(-1),))
+    if y.dtype != x.dtype:
+        y = y.to(dtype=x.dtype)
+    return y
 
 
 def has_ve(layer_idx, n_layer):
