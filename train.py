@@ -437,6 +437,13 @@ def unwrap_model(model):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
+def resolve_batch_schedule(recipe, num_gpus):
+    tokens_per_fwdbwd = recipe.device_batch_size * MAX_SEQ_LEN * num_gpus
+    grad_accum_steps = max(1, math.ceil(recipe.total_batch_size / tokens_per_fwdbwd))
+    effective_total_batch_size = grad_accum_steps * tokens_per_fwdbwd
+    return tokens_per_fwdbwd, grad_accum_steps, effective_total_batch_size
+
+
 def load_checkpoint_if_present(model, optimizer, path, device):
     if not path:
         return {"step": 0, "total_training_time": 0.0}
@@ -494,9 +501,7 @@ def run_training(args):
     print("Parameter counts:")
     for key, value in param_counts.items():
         print(f"  {key:24s}: {value:,}")
-    tokens_per_fwdbwd = recipe.device_batch_size * MAX_SEQ_LEN * num_gpus
-    assert recipe.total_batch_size % tokens_per_fwdbwd == 0
-    grad_accum_steps = recipe.total_batch_size // tokens_per_fwdbwd
+    tokens_per_fwdbwd, grad_accum_steps, effective_total_batch_size = resolve_batch_schedule(recipe, num_gpus)
     optimizer = base_model.setup_optimizer(
         unembedding_lr=recipe.unembedding_lr,
         embedding_lr=recipe.embedding_lr,
@@ -514,6 +519,13 @@ def run_training(args):
     print(f"Time budget: {time_budget}s")
     print(f"Using {num_gpus} GPU(s) with per-GPU batch size {recipe.device_batch_size} (global batch size {global_batch_size})")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
+    if effective_total_batch_size != recipe.total_batch_size:
+        print(
+            "Requested total_batch_size "
+            f"{recipe.total_batch_size:,} does not divide evenly into "
+            f"{tokens_per_fwdbwd:,}-token micro-batches; using "
+            f"{effective_total_batch_size:,} tokens/update instead."
+        )
     t_start_training = time.time()
     smooth_train_loss = 0.0
     total_training_time = float(trainer_state.get("total_training_time", 0.0))
@@ -549,8 +561,8 @@ def run_training(args):
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
         pct_done = 100 * progress
-        tok_per_sec = int(recipe.total_batch_size / dt)
-        mfu = 100 * num_flops_per_token * recipe.total_batch_size / dt / H100_BF16_PEAK_FLOPS
+        tok_per_sec = int(effective_total_batch_size / dt)
+        mfu = 100 * num_flops_per_token * effective_total_batch_size / dt / H100_BF16_PEAK_FLOPS
         remaining = max(0, time_budget - total_training_time)
         print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
         if step == 0:
@@ -561,14 +573,21 @@ def run_training(args):
         if step > 10 and total_training_time >= time_budget:
             break
     print()
-    total_tokens = step * recipe.total_batch_size
+    total_tokens = step * effective_total_batch_size
     compiled_model.eval()
     with autocast_ctx:
         selection_bpb = evaluate_bpb(compiled_model, tokenizer, global_batch_size, split=args.selection_split)
         report_bpb = evaluate_bpb(compiled_model, tokenizer, global_batch_size, split=args.report_split)
     t_end = time.time()
     startup_time = t_start_training - t_start
-    steady_state_mfu = 100 * num_flops_per_token * recipe.total_batch_size * max(step - 10, 0) / max(total_training_time, 1e-6) / H100_BF16_PEAK_FLOPS
+    steady_state_mfu = (
+        100
+        * num_flops_per_token
+        * effective_total_batch_size
+        * max(step - 10, 0)
+        / max(total_training_time, 1e-6)
+        / H100_BF16_PEAK_FLOPS
+    )
     peak_vram_mb = max(torch.cuda.max_memory_allocated(i) for i in range(num_gpus)) / 1024 / 1024
     trainer_state = {"step": step, "total_training_time": total_training_time, "epoch": epoch}
     save_checkpoint(args.save_checkpoint, model, optimizer if args.save_optimizer else None, trainer_state, recipe, config)
@@ -582,6 +601,7 @@ def run_training(args):
         "peak_vram_mb": peak_vram_mb,
         "mfu_percent": steady_state_mfu,
         "total_tokens": total_tokens,
+        "effective_total_batch_size": effective_total_batch_size,
         "num_steps": step,
         "num_params": num_params,
         "depth": recipe.depth,
